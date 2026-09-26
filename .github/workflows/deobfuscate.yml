@@ -1,0 +1,237 @@
+name: Lua Deobfuscator
+
+on:
+  workflow_dispatch:
+    inputs:
+      input_file:
+        description: "Path to the Lua/Luau file to deobfuscate"
+        required: true
+        type: string
+        default: "input.lua"
+
+      mode:
+        description: "Deobfuscation mode"
+        required: true
+        type: choice
+        options:
+          - full
+          - trace
+          - detect
+        default: full
+
+      timeout:
+        description: "Maximum execution timeout in seconds"
+        required: true
+        type: string
+        default: "90"
+
+      budget:
+        description: "Soft execution budget in seconds"
+        required: true
+        type: string
+        default: "30"
+
+      max_runs:
+        description: "Maximum anti-tamper reruns"
+        required: true
+        type: string
+        default: "12"
+
+      devirt_rounds:
+        description: "Maximum constant-decryption rounds"
+        required: true
+        type: string
+        default: "200"
+
+jobs:
+  deobfuscate:
+    name: Deobfuscate Lua
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify runtimes
+        shell: bash
+        run: |
+          set -e
+
+          echo "Node:"
+          node --version
+
+          echo "npm:"
+          npm --version
+
+          echo "Python:"
+          python --version
+
+      - name: Install Node dependencies
+        shell: bash
+        run: |
+          set -e
+
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Verify deobfuscator files
+        shell: bash
+        run: |
+          set -e
+
+          test -f deob.js
+          test -f package.json
+
+          echo "Repository layout:"
+          ls -la
+
+      - name: Validate input file
+        shell: bash
+        env:
+          INPUT_FILE: ${{ inputs.input_file }}
+        run: |
+          set -e
+
+          if [ ! -f "$INPUT_FILE" ]; then
+            echo "::error::Input file not found: $INPUT_FILE"
+            echo
+            echo "Files available in the repository:"
+            find . -maxdepth 3 -type f \
+              ! -path "./.git/*" \
+              -print | sort
+            exit 1
+          fi
+
+          echo "Input:"
+          echo "$INPUT_FILE"
+
+          echo
+          echo "File size:"
+          wc -c "$INPUT_FILE"
+
+      - name: Prepare output directory
+        shell: bash
+        run: |
+          set -e
+          rm -rf output
+          mkdir -p output
+
+      - name: Detect obfuscator
+        if: inputs.mode == 'detect'
+        shell: bash
+        env:
+          INPUT_FILE: ${{ inputs.input_file }}
+        run: |
+          set -e
+
+          node deob.js "$INPUT_FILE" --detect
+
+      - name: Full deobfuscation
+        if: inputs.mode == 'full'
+        shell: bash
+        env:
+          INPUT_FILE: ${{ inputs.input_file }}
+          TIMEOUT: ${{ inputs.timeout }}
+          BUDGET: ${{ inputs.budget }}
+          MAX_RUNS: ${{ inputs.max_runs }}
+          DEVIRT_ROUNDS: ${{ inputs.devirt_rounds }}
+        run: |
+          set -e
+
+          BASENAME="$(basename "$INPUT_FILE")"
+          NAME="${BASENAME%.*}"
+
+          OUTPUT="output/${NAME}_deobfuscated.lua"
+
+          echo "Running full deobfuscation..."
+          echo "Input:  $INPUT_FILE"
+          echo "Output: $OUTPUT"
+
+          node deob.js \
+            "$INPUT_FILE" \
+            --output "$OUTPUT" \
+            --timeout "$TIMEOUT" \
+            --budget "$BUDGET" \
+            --max-runs "$MAX_RUNS" \
+            --devirt-rounds "$DEVIRT_ROUNDS"
+
+      - name: Trace mode
+        if: inputs.mode == 'trace'
+        shell: bash
+        env:
+          INPUT_FILE: ${{ inputs.input_file }}
+          TIMEOUT: ${{ inputs.timeout }}
+          BUDGET: ${{ inputs.budget }}
+          MAX_RUNS: ${{ inputs.max_runs }}
+        run: |
+          set -e
+
+          BASENAME="$(basename "$INPUT_FILE")"
+          NAME="${BASENAME%.*}"
+
+          OUTPUT="output/${NAME}_trace.lua"
+
+          echo "Running trace-only mode..."
+          echo "Input:  $INPUT_FILE"
+          echo "Output: $OUTPUT"
+
+          node deob.js \
+            "$INPUT_FILE" \
+            --output "$OUTPUT" \
+            --no-devirt \
+            --timeout "$TIMEOUT" \
+            --budget "$BUDGET" \
+            --max-runs "$MAX_RUNS"
+
+      - name: Collect generated files
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p output
+
+          echo "===== OUTPUT DIRECTORY ====="
+          find output -maxdepth 5 -type f -print -exec wc -c {} \; \
+            || true
+
+          echo
+          echo "===== WORKSPACE ====="
+          find . -maxdepth 3 -type f \
+            ! -path "./.git/*" \
+            -print | sort | head -500 \
+            || true
+
+      - name: Upload deobfuscation result
+        if: success() && inputs.mode != 'detect'
+        uses: actions/upload-artifact@v4
+        with:
+          name: deobfuscated-lua-${{ github.run_number }}
+          path: output/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload debug output
+        if: always() && inputs.mode != 'detect'
+        uses: actions/upload-artifact@v4
+        with:
+          name: deobfuscator-debug-${{ github.run_number }}
+          path: |
+            output/
+          if-no-files-found: ignore
+          retention-days: 3
