@@ -1,237 +1,169 @@
-name: Lua Deobfuscator
+name: XP-Compatible Game Runner
 
 on:
   workflow_dispatch:
-    inputs:
-      input_file:
-        description: "Path to the Lua/Luau file to deobfuscate"
-        required: true
-        type: string
-        default: "input.lua"
-
-      mode:
-        description: "Deobfuscation mode"
-        required: true
-        type: choice
-        options:
-          - full
-          - trace
-          - detect
-        default: full
-
-      timeout:
-        description: "Maximum execution timeout in seconds"
-        required: true
-        type: string
-        default: "90"
-
-      budget:
-        description: "Soft execution budget in seconds"
-        required: true
-        type: string
-        default: "30"
-
-      max_runs:
-        description: "Maximum anti-tamper reruns"
-        required: true
-        type: string
-        default: "12"
-
-      devirt_rounds:
-        description: "Maximum constant-decryption rounds"
-        required: true
-        type: string
-        default: "200"
+  push:
+    paths:
+      - 'plants_vs_zombies.zip'
+      - '.github/workflows/xp-game-runner.yml'
 
 jobs:
-  deobfuscate:
-    name: Deobfuscate Lua
-    runs-on: ubuntu-latest
-
-    permissions:
-      contents: read
-
+  prepare-xp-runner:
+    runs-on: ubuntu-22.04
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          cache: npm
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Verify runtimes
-        shell: bash
+      - name: Install Wine + dependencies
         run: |
-          set -e
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y wine64 wine32 winetricks cabextract unzip p7zip-full xvfb
 
-          echo "Node:"
-          node --version
-
-          echo "npm:"
-          npm --version
-
-          echo "Python:"
-          python --version
-
-      - name: Install Node dependencies
-        shell: bash
-        run: |
-          set -e
-
-          if [ -f package-lock.json ]; then
-            npm ci
-          else
-            npm install
-          fi
-
-      - name: Verify deobfuscator files
-        shell: bash
-        run: |
-          set -e
-
-          test -f deob.js
-          test -f package.json
-
-          echo "Repository layout:"
-          ls -la
-
-      - name: Validate input file
-        shell: bash
+      - name: Create Wine prefix (Windows XP)
         env:
-          INPUT_FILE: ${{ inputs.input_file }}
+          WINEPREFIX: ${{ github.workspace }}/wine-xp
+          WINEARCH: win32
         run: |
-          set -e
+          mkdir -p "$WINEPREFIX"
+          wineboot --init
+          winetricks -q winxp
+          winetricks -q corefonts vcrun6 vcrun2005 vcrun2008 vcrun2010 d3dx9
+          wine reg add "HKCU\\Software\\Wine" /v Version /t REG_SZ /d "winxp" /f
+          wine reg add "HKCU\\Software\\Wine\\DllOverrides" /v d3d9 /t REG_SZ /d "native,builtin" /f
+          # Map host Downloads into the Wine drive list
+          mkdir -p "$WINEPREFIX/dosdevices"
+          ln -sf "$HOME/Downloads" "$WINEPREFIX/dosdevices/d:"
+          wine reg add "HKCU\\Software\\Wine\\Drives" /v d: /t REG_SZ /d "Downloads" /f || true
 
-          if [ ! -f "$INPUT_FILE" ]; then
-            echo "::error::Input file not found: $INPUT_FILE"
-            echo
-            echo "Files available in the repository:"
-            find . -maxdepth 3 -type f \
-              ! -path "./.git/*" \
-              -print | sort
+      - name: Extract game zip
+        run: |
+          mkdir -p game
+          unzip -o plants_vs_zombies.zip -d game
+          if [ $(find game -mindepth 1 -maxdepth 1 -type d | wc -l) -eq 1 ]; then
+            TOP=$(find game -mindepth 1 -maxdepth 1 -type d)
+            mv "$TOP"/* game/ 2>/dev/null || true
+            rmdir "$TOP" 2>/dev/null || true
+          fi
+          find game -type f -name "*.exe" -print
+
+      - name: Create launcher scripts (with Downloads access)
+        env:
+          WINEPREFIX: ${{ github.workspace }}/wine-xp
+        run: |
+          cat > run-game.sh << 'EOF'
+          #!/bin/bash
+          set -e
+          export WINEPREFIX="$(pwd)/wine-xp"
+          export WINEARCH=win32
+          export WINEDLLOVERRIDES="mscoree,mshtml="
+          # Ensure Downloads is always mapped
+          mkdir -p "$WINEPREFIX/dosdevices"
+          ln -sfn "$HOME/Downloads" "$WINEPREFIX/dosdevices/d:" 2>/dev/null || true
+          cd game
+          EXE=$(find . -maxdepth 2 \( -iname "*plants*zombies*.exe" -o -iname "pvz*.exe" -o -iname "*.exe" \) | head -1)
+          if [ -z "$EXE" ]; then
+            echo "No .exe found in game/"
+            exit 1
+          fi
+          echo "Launching: $EXE"
+          wine "\( EXE" " \)@"
+          EOF
+          chmod +x run-game.sh
+
+          cat > run-any-exe.sh << 'EOF'
+          #!/bin/bash
+          set -e
+          export WINEPREFIX="$(pwd)/wine-xp"
+          export WINEARCH=win32
+          export WINEDLLOVERRIDES="mscoree,mshtml="
+          mkdir -p "$WINEPREFIX/dosdevices"
+          ln -sfn "$HOME/Downloads" "$WINEPREFIX/dosdevices/d:" 2>/dev/null || true
+          if [ $# -lt 1 ]; then
+            echo "Usage: $0 <path-to-exe> [args...]"
+            echo "Example: $0 \~/Downloads/SomeGame.exe"
+            echo "Or:      $0 d:\\\\SomeGame.exe   (Wine drive letter for Downloads)"
+            exit 1
+          fi
+          wine "$@"
+          EOF
+          chmod +x run-any-exe.sh
+
+          cat > play-from-downloads.sh << 'EOF'
+          #!/bin/bash
+          set -e
+          export WINEPREFIX="$(pwd)/wine-xp"
+          export WINEARCH=win32
+          export WINEDLLOVERRIDES="mscoree,mshtml="
+          mkdir -p "$WINEPREFIX/dosdevices"
+          ln -sfn "$HOME/Downloads" "$WINEPREFIX/dosdevices/d:" 2>/dev/null || true
+
+          DOWNLOADS="$HOME/Downloads"
+          if [ ! -d "$DOWNLOADS" ]; then
+            echo "Downloads folder not found: $DOWNLOADS"
             exit 1
           fi
 
-          echo "Input:"
-          echo "$INPUT_FILE"
+          echo "=== .exe files in $DOWNLOADS ==="
+          mapfile -t EXES < <(find "$DOWNLOADS" -maxdepth 2 -type f -iname "*.exe" | sort)
+          if [ ${#EXES[@]} -eq 0 ]; then
+            echo "No .exe files found in Downloads."
+            exit 0
+          fi
 
+          for i in "${!EXES[@]}"; do
+            printf "%2d) %s\n" \( ((i+1)) " \){EXES[$i]}"
+          done
           echo
-          echo "File size:"
-          wc -c "$INPUT_FILE"
+          read -p "Choose number (or q to quit): " choice
+          if [[ "$choice" == "q" || "$choice" == "Q" ]]; then
+            exit 0
+          fi
+          if ! [[ "\( choice" =\~ ^[0-9]+ \) ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt ${#EXES[@]} ]; then
+            echo "Invalid choice."
+            exit 1
+          fi
 
-      - name: Prepare output directory
-        shell: bash
-        run: |
-          set -e
-          rm -rf output
-          mkdir -p output
+          SELECTED="\( {EXES[ \)((choice-1))]}"
+          echo "Launching: $SELECTED"
+          wine "$SELECTED"
+          EOF
+          chmod +x play-from-downloads.sh
 
-      - name: Detect obfuscator
-        if: inputs.mode == 'detect'
-        shell: bash
+      - name: Smoke-test Wine XP prefix + Downloads mapping
         env:
-          INPUT_FILE: ${{ inputs.input_file }}
+          WINEPREFIX: ${{ github.workspace }}/wine-xp
+          WINEARCH: win32
         run: |
-          set -e
+          xvfb-run -a wine --version
+          ls -l "$WINEPREFIX/dosdevices/" || true
+          xvfb-run -a wine reg query "HKCU\\Software\\Wine" /v Version || true
 
-          node deob.js "$INPUT_FILE" --detect
-
-      - name: Full deobfuscation
-        if: inputs.mode == 'full'
-        shell: bash
-        env:
-          INPUT_FILE: ${{ inputs.input_file }}
-          TIMEOUT: ${{ inputs.timeout }}
-          BUDGET: ${{ inputs.budget }}
-          MAX_RUNS: ${{ inputs.max_runs }}
-          DEVIRT_ROUNDS: ${{ inputs.devirt_rounds }}
+      - name: Package artifact
         run: |
-          set -e
+          mkdir -p dist
+          cp -a wine-xp dist/
+          cp -a game dist/
+          cp run-game.sh run-any-exe.sh play-from-downloads.sh dist/
+          cat > dist/README.txt << 'EOF'
+          Windows XP Wine Runner – Downloads access enabled
 
-          BASENAME="$(basename "$INPUT_FILE")"
-          NAME="${BASENAME%.*}"
+          Quick start:
+            ./run-game.sh                     # runs the pack that came with the zip
+            ./play-from-downloads.sh          # lists every .exe in \~/Downloads and lets you pick one
+            ./run-any-exe.sh \~/Downloads/foo.exe
 
-          OUTPUT="output/${NAME}_deobfuscated.lua"
+          Wine drive mapping:
+            D:  →  your real \~/Downloads folder
 
-          echo "Running full deobfuscation..."
-          echo "Input:  $INPUT_FILE"
-          echo "Output: $OUTPUT"
+          You can also launch with the Wine path:
+            wine d:\\SomeGame.exe
+          EOF
+          tar -czf xp-pvz-runner.tar.gz -C dist .
 
-          node deob.js \
-            "$INPUT_FILE" \
-            --output "$OUTPUT" \
-            --timeout "$TIMEOUT" \
-            --budget "$BUDGET" \
-            --max-runs "$MAX_RUNS" \
-            --devirt-rounds "$DEVIRT_ROUNDS"
-
-      - name: Trace mode
-        if: inputs.mode == 'trace'
-        shell: bash
-        env:
-          INPUT_FILE: ${{ inputs.input_file }}
-          TIMEOUT: ${{ inputs.timeout }}
-          BUDGET: ${{ inputs.budget }}
-          MAX_RUNS: ${{ inputs.max_runs }}
-        run: |
-          set -e
-
-          BASENAME="$(basename "$INPUT_FILE")"
-          NAME="${BASENAME%.*}"
-
-          OUTPUT="output/${NAME}_trace.lua"
-
-          echo "Running trace-only mode..."
-          echo "Input:  $INPUT_FILE"
-          echo "Output: $OUTPUT"
-
-          node deob.js \
-            "$INPUT_FILE" \
-            --output "$OUTPUT" \
-            --no-devirt \
-            --timeout "$TIMEOUT" \
-            --budget "$BUDGET" \
-            --max-runs "$MAX_RUNS"
-
-      - name: Collect generated files
-        if: always()
-        shell: bash
-        run: |
-          mkdir -p output
-
-          echo "===== OUTPUT DIRECTORY ====="
-          find output -maxdepth 5 -type f -print -exec wc -c {} \; \
-            || true
-
-          echo
-          echo "===== WORKSPACE ====="
-          find . -maxdepth 3 -type f \
-            ! -path "./.git/*" \
-            -print | sort | head -500 \
-            || true
-
-      - name: Upload deobfuscation result
-        if: success() && inputs.mode != 'detect'
+      - name: Upload runner artifact
         uses: actions/upload-artifact@v4
         with:
-          name: deobfuscated-lua-${{ github.run_number }}
-          path: output/
-          if-no-files-found: error
-          retention-days: 7
-
-      - name: Upload debug output
-        if: always() && inputs.mode != 'detect'
-        uses: actions/upload-artifact@v4
-        with:
-          name: deobfuscator-debug-${{ github.run_number }}
-          path: |
-            output/
-          if-no-files-found: ignore
-          retention-days: 3
+          name: xp-pvz-runner
+          path: xp-pvz-runner.tar.gz
+          retention-days: 30
