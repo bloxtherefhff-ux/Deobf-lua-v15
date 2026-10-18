@@ -20,21 +20,40 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y wine64 wine32 winetricks cabextract unzip p7zip-full xvfb
 
-      - name: Create Wine prefix (Windows XP)
+      - name: Create Wine prefix (Windows XP) – headless
         env:
           WINEPREFIX: ${{ github.workspace }}/wine-xp
           WINEARCH: win32
+          DISPLAY: :99
         run: |
           mkdir -p "$WINEPREFIX"
-          wineboot --init
-          winetricks -q winxp
-          winetricks -q corefonts vcrun6 vcrun2005 vcrun2008 vcrun2010 d3dx9
-          wine reg add "HKCU\\Software\\Wine" /v Version /t REG_SZ /d "winxp" /f
-          wine reg add "HKCU\\Software\\Wine\\DllOverrides" /v d3d9 /t REG_SZ /d "native,builtin" /f
-          # Map host Downloads into the Wine drive list
+          # Start a virtual X server for the entire step
+          Xvfb :99 -screen 0 1024x768x24 > /tmp/xvfb.log 2>&1 &
+          XVFB_PID=$!
+          sleep 2
+
+          # Initialize prefix under Xvfb
+          xvfb-run -a wineboot --init
+
+          # Install only the components that install cleanly headless
+          # (vcrun6 is skipped – it requires a real window and is not required for PVZ / classic XP games)
+          xvfb-run -a winetricks -q winxp
+          xvfb-run -a winetricks -q corefonts
+          xvfb-run -a winetricks -q vcrun2005
+          xvfb-run -a winetricks -q vcrun2008
+          xvfb-run -a winetricks -q vcrun2010
+          xvfb-run -a winetricks -q d3dx9
+
+          # Force XP version in registry
+          xvfb-run -a wine reg add "HKCU\\Software\\Wine" /v Version /t REG_SZ /d "winxp" /f
+          xvfb-run -a wine reg add "HKCU\\Software\\Wine\\DllOverrides" /v d3d9 /t REG_SZ /d "native,builtin" /f
+
+          # Map host Downloads as drive D:
           mkdir -p "$WINEPREFIX/dosdevices"
-          ln -sf "$HOME/Downloads" "$WINEPREFIX/dosdevices/d:"
-          wine reg add "HKCU\\Software\\Wine\\Drives" /v d: /t REG_SZ /d "Downloads" /f || true
+          ln -sfn "$HOME/Downloads" "$WINEPREFIX/dosdevices/d:" || true
+
+          # Clean up the virtual display
+          kill $XVFB_PID 2>/dev/null || true
 
       - name: Extract game zip
         run: |
@@ -47,7 +66,7 @@ jobs:
           fi
           find game -type f -name "*.exe" -print
 
-      - name: Create launcher scripts (with Downloads access)
+      - name: Create launcher scripts (Downloads access)
         env:
           WINEPREFIX: ${{ github.workspace }}/wine-xp
         run: |
@@ -57,7 +76,6 @@ jobs:
           export WINEPREFIX="$(pwd)/wine-xp"
           export WINEARCH=win32
           export WINEDLLOVERRIDES="mscoree,mshtml="
-          # Ensure Downloads is always mapped
           mkdir -p "$WINEPREFIX/dosdevices"
           ln -sfn "$HOME/Downloads" "$WINEPREFIX/dosdevices/d:" 2>/dev/null || true
           cd game
@@ -82,7 +100,7 @@ jobs:
           if [ $# -lt 1 ]; then
             echo "Usage: $0 <path-to-exe> [args...]"
             echo "Example: $0 \~/Downloads/SomeGame.exe"
-            echo "Or:      $0 d:\\\\SomeGame.exe   (Wine drive letter for Downloads)"
+            echo "Or:      $0 'd:\\SomeGame.exe'"
             exit 1
           fi
           wine "$@"
@@ -130,7 +148,7 @@ jobs:
           EOF
           chmod +x play-from-downloads.sh
 
-      - name: Smoke-test Wine XP prefix + Downloads mapping
+      - name: Smoke-test Wine XP prefix
         env:
           WINEPREFIX: ${{ github.workspace }}/wine-xp
           WINEARCH: win32
@@ -155,9 +173,6 @@ jobs:
 
           Wine drive mapping:
             D:  →  your real \~/Downloads folder
-
-          You can also launch with the Wine path:
-            wine d:\\SomeGame.exe
           EOF
           tar -czf xp-pvz-runner.tar.gz -C dist .
 
