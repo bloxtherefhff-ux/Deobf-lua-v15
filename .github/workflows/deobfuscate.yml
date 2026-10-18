@@ -19,7 +19,7 @@ jobs:
           sudo dpkg --add-architecture i386
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            wine64 wine32 winetricks cabextract unzip p7zip-full xvfb zip \
+            wine64 wine32 winetricks cabextract unzip p7zip-full xvfb zip rsync \
             libgl1-mesa-glx libglu1-mesa
 
       - name: Create Wine prefix (Windows XP) – fully headless + force
@@ -51,8 +51,9 @@ jobs:
           xvfb-run -a wine reg add "HKCU\\Software\\Wine\\DllOverrides" /v d3d9 /t REG_SZ /d "native,builtin" /f || true
           xvfb-run -a wine reg add "HKCU\\Software\\Wine\\DllOverrides" /v d3d8 /t REG_SZ /d "native,builtin" /f || true
 
+          # Keep dosdevices clean – never leave host absolute links that can cycle
           mkdir -p "$WINEPREFIX/dosdevices"
-          ln -sfn /tmp "$WINEPREFIX/dosdevices/d:" || true
+          rm -f "$WINEPREFIX/dosdevices"/[a-z]: 2>/dev/null || true
 
           kill $XVFB_PID 2>/dev/null || true
           sleep 1
@@ -170,12 +171,30 @@ jobs:
           xvfb-run -a wine reg query "HKCU\\Software\\Wine" /v Version || true
           echo "Smoke test done."
 
-      - name: Package as real ZIP (no .tar.gz)
+      - name: Package as real ZIP (no recursion)
         run: |
+          set -e
+          # CRITICAL: destroy any host symlinks that can create infinite recursion
+          # when the prefix is copied under dist/
+          find wine-xp/dosdevices -type l -delete 2>/dev/null || true
+          rm -f wine-xp/dosdevices/[a-z]: 2>/dev/null || true
+
+          # Also kill any accidental links that point back into the workspace
+          find wine-xp -type l -lname '*Deobf-lua-v15*' -delete 2>/dev/null || true
+          find wine-xp -type l -lname '*runner*' -delete 2>/dev/null || true
+
+          rm -rf dist
           mkdir -p dist
-          cp -a wine-xp dist/
+
+          # Safe copy – never follow symlinks into a cycle
+          rsync -a --copy-links --exclude 'dosdevices/[a-z]:' wine-xp/ dist/wine-xp/
+          # Guarantee clean dosdevices
+          mkdir -p dist/wine-xp/dosdevices
+          rm -f dist/wine-xp/dosdevices/[a-z]: 2>/dev/null || true
+
           cp -a game dist/
           cp run-game.sh run-any-exe.sh play-from-downloads.sh dist/
+
           cat > dist/README.txt << 'EOF'
           Windows XP Wine Runner
 
@@ -188,6 +207,7 @@ jobs:
                  ./run-any-exe.sh \~/Downloads/yourgame.exe
 
           D: drive inside Wine = your real Downloads folder
+          (the mapping is created automatically by the launch scripts)
           EOF
 
           cd dist
@@ -195,7 +215,7 @@ jobs:
           cd ..
           ls -lh xp-pvz-runner.zip
           echo "=== ZIP contents preview ==="
-          unzip -l xp-pvz-runner.zip | head -30
+          unzip -l xp-pvz-runner.zip | head -40
 
       - name: Upload runner artifact
         uses: actions/upload-artifact@v4
