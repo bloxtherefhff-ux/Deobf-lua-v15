@@ -5,7 +5,7 @@ on:
   push:
     paths:
       - 'plants_vs_zombies.zip'
-      - '.github/workflows/xp-game-runner.yml'
+      - '.github/workflows/deobfuscate.yml'
 
 jobs:
   prepare-xp-runner:
@@ -190,7 +190,6 @@ jobs:
           D: drive inside Wine = your real Downloads folder
           EOF
 
-          # Create a normal .zip that any phone / Windows / Android can open
           cd dist
           zip -r -9 ../xp-pvz-runner.zip .
           cd ..
