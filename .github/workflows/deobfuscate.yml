@@ -1,225 +1,93 @@
-name: XP-Compatible Game Runner
+name: Build Custom Winlator-like APK
 
 on:
   workflow_dispatch:
   push:
     paths:
-      - 'plants_vs_zombies.zip'
-      - '.github/workflows/deobfuscate.yml'
+      - 'games.zip'
+      - '.github/workflows/build-winlator-apk.yml'
 
 jobs:
-  prepare-xp-runner:
+  build-apk:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Wine + dependencies
+      - name: Install tools
         run: |
-          sudo dpkg --add-architecture i386
           sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            wine64 wine32 winetricks cabextract unzip p7zip-full xvfb zip rsync \
-            libgl1-mesa-glx libglu1-mesa
+          sudo apt-get install -y -qq unzip zip apksigner zipalign openjdk-17-jdk wget
 
-      - name: Create Wine prefix (Windows XP) – fully headless + force
-        env:
-          WINEPREFIX: ${{ github.workspace }}/wine-xp
-          WINEARCH: win32
-          WINEDEBUG: -all
+      - name: Download base Winlator APK (open-source release)
         run: |
-          set -e
-          mkdir -p "$WINEPREFIX"
-          rm -rf "$WINEPREFIX"/* 2>/dev/null || true
+          # Using a public release as base. Change the URL when a newer one appears.
+          # This is the practical way – full native rebuild is not feasible on GHA.
+          wget -O base.apk "https://github.com/brunodev85/winlator/releases/download/v7.1.0/Winlator-7.1.apk" || \
+          wget -O base.apk "https://github.com/brunodev85/winlator/releases/latest/download/app-release.apk"
 
-          Xvfb :99 -screen 0 1024x768x24 -ac +extension GLX +render -noreset > /tmp/xvfb.log 2>&1 &
-          XVFB_PID=$!
-          export DISPLAY=:99
-          sleep 3
+          # Fallback if the above links move – you can replace with any public Winlator APK URL
+          ls -lh base.apk
 
-          xvfb-run -a wineboot --init || true
-          sleep 2
-
-          xvfb-run -a winetricks -q --force winxp || true
-          xvfb-run -a winetricks -q --force corefonts || true
-          xvfb-run -a winetricks -q --force vcrun2005 || true
-          xvfb-run -a winetricks -q --force vcrun2008 || true
-          xvfb-run -a winetricks -q --force vcrun2010 || true
-          xvfb-run -a winetricks -q --force d3dx9 || true
-
-          xvfb-run -a wine reg add "HKCU\\Software\\Wine" /v Version /t REG_SZ /d "winxp" /f || true
-          xvfb-run -a wine reg add "HKCU\\Software\\Wine\\DllOverrides" /v d3d9 /t REG_SZ /d "native,builtin" /f || true
-          xvfb-run -a wine reg add "HKCU\\Software\\Wine\\DllOverrides" /v d3d8 /t REG_SZ /d "native,builtin" /f || true
-
-          # Keep dosdevices clean – never leave host absolute links that can cycle
-          mkdir -p "$WINEPREFIX/dosdevices"
-          rm -f "$WINEPREFIX/dosdevices"/[a-z]: 2>/dev/null || true
-
-          kill $XVFB_PID 2>/dev/null || true
-          sleep 1
-          echo "Prefix created."
-
-      - name: Extract game zip
+      - name: Unpack base APK
         run: |
-          set -e
-          if [ ! -f plants_vs_zombies.zip ]; then
-            echo "ERROR: plants_vs_zombies.zip not found in repo root"
-            exit 1
-          fi
-          mkdir -p game
-          unzip -o plants_vs_zombies.zip -d game
-          if [ $(find game -mindepth 1 -maxdepth 1 -type d | wc -l) -eq 1 ] && \
-             [ $(find game -mindepth 1 -maxdepth 1 -type f | wc -l) -eq 0 ]; then
-            TOP=$(find game -mindepth 1 -maxdepth 1 -type d)
-            mv "$TOP"/* game/ 2>/dev/null || true
-            rmdir "$TOP" 2>/dev/null || true
-          fi
-          echo "=== .exe files found ==="
-          find game -type f -iname "*.exe" -print || true
+          mkdir -p apk_unpacked
+          unzip -q base.apk -d apk_unpacked
+          ls apk_unpacked
 
-      - name: Create launcher scripts (Downloads access)
+      - name: Inject game zip
         run: |
-          cat > run-game.sh << 'EOF'
-          #!/bin/bash
-          set -e
-          export WINEPREFIX="$(pwd)/wine-xp"
-          export WINEARCH=win32
-          export WINEDLLOVERRIDES="mscoree,mshtml="
-          export WINEDEBUG=-all
-          mkdir -p "$WINEPREFIX/dosdevices"
-          ln -sfn "${HOME}/Downloads" "$WINEPREFIX/dosdevices/d:" 2>/dev/null || true
-          cd game
-          EXE=$(find . -maxdepth 3 \( -iname "*plants*zombies*.exe" -o -iname "pvz*.exe" -o -iname "*.exe" \) | head -1)
-          if [ -z "$EXE" ]; then
-            echo "No .exe found in game/"
-            exit 1
-          fi
-          echo "Launching: $EXE"
-          wine "\( EXE" " \)@"
-          EOF
-          chmod +x run-game.sh
-
-          cat > run-any-exe.sh << 'EOF'
-          #!/bin/bash
-          set -e
-          export WINEPREFIX="$(pwd)/wine-xp"
-          export WINEARCH=win32
-          export WINEDLLOVERRIDES="mscoree,mshtml="
-          export WINEDEBUG=-all
-          mkdir -p "$WINEPREFIX/dosdevices"
-          ln -sfn "${HOME}/Downloads" "$WINEPREFIX/dosdevices/d:" 2>/dev/null || true
-          if [ $# -lt 1 ]; then
-            echo "Usage: $0 <path-to-exe> [args...]"
-            echo "  $0 \~/Downloads/SomeGame.exe"
-            echo "  $0 'd:\\SomeGame.exe'"
-            exit 1
-          fi
-          wine "$@"
-          EOF
-          chmod +x run-any-exe.sh
-
-          cat > play-from-downloads.sh << 'EOF'
-          #!/bin/bash
-          set -e
-          export WINEPREFIX="$(pwd)/wine-xp"
-          export WINEARCH=win32
-          export WINEDLLOVERRIDES="mscoree,mshtml="
-          export WINEDEBUG=-all
-          mkdir -p "$WINEPREFIX/dosdevices"
-          ln -sfn "${HOME}/Downloads" "$WINEPREFIX/dosdevices/d:" 2>/dev/null || true
-
-          DOWNLOADS="${HOME}/Downloads"
-          if [ ! -d "$DOWNLOADS" ]; then
-            echo "Downloads folder not found: $DOWNLOADS"
-            exit 1
+          if [ ! -f games.zip ]; then
+            echo "games.zip not found – using empty placeholder"
+            mkdir -p games_content
+            echo "Put your .exe games here" > games_content/README.txt
+            zip -r games.zip games_content
           fi
 
-          echo "=== .exe files in $DOWNLOADS ==="
-          mapfile -t EXES < <(find "$DOWNLOADS" -maxdepth 2 -type f -iname "*.exe" 2>/dev/null | sort)
-          if [ ${#EXES[@]} -eq 0 ]; then
-            echo "No .exe files found in Downloads."
-            exit 0
-          fi
+          # Put the games into the assets so the app can see them
+          mkdir -p apk_unpacked/assets/games
+          unzip -o games.zip -d apk_unpacked/assets/games
 
-          for i in "${!EXES[@]}"; do
-            printf "%2d) %s\n" \( ((i+1)) " \){EXES[$i]}"
-          done
-          echo
-          read -p "Choose number (or q to quit): " choice
-          if [[ "$choice" == "q" || "$choice" == "Q" ]]; then
-            exit 0
-          fi
-          if ! [[ "\( choice" =\~ ^[0-9]+ \) ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt ${#EXES[@]} ]; then
-            echo "Invalid choice."
-            exit 1
-          fi
+          # Optional: also place a copy in a default container path if the base supports it
+          mkdir -p apk_unpacked/assets/containers/default
+          cp -r apk_unpacked/assets/games/* apk_unpacked/assets/containers/default/ 2>/dev/null || true
 
-          SELECTED="\( {EXES[ \)((choice-1))]}"
-          echo "Launching: $SELECTED"
-          wine "$SELECTED"
-          EOF
-          chmod +x play-from-downloads.sh
-
-      - name: Smoke-test
-        env:
-          WINEPREFIX: ${{ github.workspace }}/wine-xp
-          WINEARCH: win32
-          WINEDEBUG: -all
+      - name: Rebrand (optional but recommended)
         run: |
-          xvfb-run -a wine --version
-          ls -l "$WINEPREFIX/dosdevices/" || true
-          xvfb-run -a wine reg query "HKCU\\Software\\Wine" /v Version || true
-          echo "Smoke test done."
+          # Change package name so it installs side-by-side with original Winlator
+          # This is a simple string replace – for production use apktool properly
+          find apk_unpacked -type f \( -name "*.xml" -o -name "*.smali" -o -name "AndroidManifest.xml" \) -print0 | \
+            xargs -0 sed -i 's/com.winlator/com.yourname.xpplayer/g' || true
 
-      - name: Package as real ZIP (no recursion)
+          # Change visible app name
+          find apk_unpacked -name "strings.xml" -print0 | \
+            xargs -0 sed -i 's/>Winlator</>XP Game Player</g' || true
+
+      - name: Repack APK
         run: |
-          set -e
-          # CRITICAL: destroy any host symlinks that can create infinite recursion
-          # when the prefix is copied under dist/
-          find wine-xp/dosdevices -type l -delete 2>/dev/null || true
-          rm -f wine-xp/dosdevices/[a-z]: 2>/dev/null || true
-
-          # Also kill any accidental links that point back into the workspace
-          find wine-xp -type l -lname '*Deobf-lua-v15*' -delete 2>/dev/null || true
-          find wine-xp -type l -lname '*runner*' -delete 2>/dev/null || true
-
-          rm -rf dist
-          mkdir -p dist
-
-          # Safe copy – never follow symlinks into a cycle
-          rsync -a --copy-links --exclude 'dosdevices/[a-z]:' wine-xp/ dist/wine-xp/
-          # Guarantee clean dosdevices
-          mkdir -p dist/wine-xp/dosdevices
-          rm -f dist/wine-xp/dosdevices/[a-z]: 2>/dev/null || true
-
-          cp -a game dist/
-          cp run-game.sh run-any-exe.sh play-from-downloads.sh dist/
-
-          cat > dist/README.txt << 'EOF'
-          Windows XP Wine Runner
-
-          How to use (Linux):
-            1. Extract this entire zip
-            2. Open a terminal inside the extracted folder
-            3. Run one of:
-                 ./run-game.sh
-                 ./play-from-downloads.sh
-                 ./run-any-exe.sh \~/Downloads/yourgame.exe
-
-          D: drive inside Wine = your real Downloads folder
-          (the mapping is created automatically by the launch scripts)
-          EOF
-
-          cd dist
-          zip -r -9 ../xp-pvz-runner.zip .
+          cd apk_unpacked
+          zip -r -9 ../unsigned.apk .
           cd ..
-          ls -lh xp-pvz-runner.zip
-          echo "=== ZIP contents preview ==="
-          unzip -l xp-pvz-runner.zip | head -40
 
-      - name: Upload runner artifact
+          # Align
+          zipalign -v 4 unsigned.apk aligned.apk
+
+      - name: Sign APK (debug key for testing)
+        run: |
+          # Generate a temporary debug keystore
+          keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey \
+            -keypass android -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=XP Player, OU=Dev, O=Dev, L=City, S=State, C=US" || true
+
+          apksigner sign --ks debug.keystore --ks-pass pass:android --key-pass pass:android \
+            --out XP-Game-Player.apk aligned.apk
+
+          apksigner verify XP-Game-Player.apk
+          ls -lh XP-Game-Player.apk
+
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: xp-pvz-runner
-          path: xp-pvz-runner.zip
+          name: XP-Game-Player-APK
+          path: XP-Game-Player.apk
           retention-days: 30
