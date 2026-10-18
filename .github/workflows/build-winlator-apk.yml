@@ -1,0 +1,107 @@
+name: Build Custom Winlator-like APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'plants_vs_zombies.zip'
+      - 'games.zip'
+      - '.github/workflows/build-winlator-apk.yml'
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq unzip zip apksigner zipalign openjdk-17-jdk-headless wget curl
+
+      - name: Prepare games zip
+        run: |
+          if [ -f plants_vs_zombies.zip ]; then
+            cp plants_vs_zombies.zip games.zip
+            echo "Using plants_vs_zombies.zip as games.zip"
+          elif [ -f games.zip ]; then
+            echo "games.zip already present"
+          else
+            echo "No game zip found – creating placeholder"
+            mkdir -p games_content
+            echo "Drop your .exe files into this zip" > games_content/README.txt
+            zip -r games.zip games_content
+          fi
+          ls -lh games.zip
+
+      - name: Download base Winlator APK
+        run: |
+          set -e
+          URLS=(
+            "https://github.com/brunodev85/winlator/releases/download/v7.1.0/Winlator-7.1.apk"
+            "https://github.com/brunodev85/winlator/releases/latest/download/app-debug.apk"
+            "https://github.com/brunodev85/winlator/releases/latest/download/app-release.apk"
+          )
+          SUCCESS=0
+          for url in "${URLS[@]}"; do
+            echo "Trying $url"
+            if wget -q --spider "$url" 2>/dev/null; then
+              wget -O base.apk "$url" && SUCCESS=1 && break
+            fi
+          done
+          if [ $SUCCESS -eq 0 ]; then
+            echo "Could not download a base APK from known URLs."
+            echo "Update the URL list in the workflow with a working public Winlator APK link."
+            exit 1
+          fi
+          ls -lh base.apk
+
+      - name: Unpack base APK
+        run: |
+          mkdir -p apk_unpacked
+          unzip -q base.apk -d apk_unpacked || unzip -o base.apk -d apk_unpacked
+          ls apk_unpacked | head -20
+
+      - name: Inject games into assets
+        run: |
+          mkdir -p apk_unpacked/assets/games
+          unzip -o games.zip -d apk_unpacked/assets/games
+          mkdir -p apk_unpacked/assets/containers/default/drive_c/games
+          cp -r apk_unpacked/assets/games/* apk_unpacked/assets/containers/default/drive_c/games/ 2>/dev/null || true
+          echo "Games injected:"
+          find apk_unpacked/assets -name "*.exe" | head -20
+
+      - name: Simple rebrand
+        run: |
+          find apk_unpacked -type f \( -name "AndroidManifest.xml" -o -name "*.xml" -o -name "*.smali" \) -print0 2>/dev/null | \
+            xargs -0 sed -i 's/com\.winlator/com.xpplayer.custom/g' 2>/dev/null || true
+          find apk_unpacked -name "strings.xml" -print0 2>/dev/null | \
+            xargs -0 sed -i 's/>Winlator</>XP Game Player</g' 2>/dev/null || true
+          echo "Rebrand attempted"
+
+      - name: Repack + align
+        run: |
+          cd apk_unpacked
+          zip -r -9 ../unsigned.apk .
+          cd ..
+          zipalign -f -v 4 unsigned.apk aligned.apk
+          ls -lh aligned.apk
+
+      - name: Sign APK (debug key)
+        run: |
+          keytool -genkeypair -v -keystore debug.keystore -storepass android -alias androiddebugkey \
+            -keypass android -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=XP Game Player, OU=Dev, O=Custom, L=City, ST=State, C=US" 2>/dev/null || true
+          apksigner sign --ks debug.keystore --ks-pass pass:android --key-pass pass:android \
+            --out XP-Game-Player.apk aligned.apk
+          apksigner verify XP-Game-Player.apk
+          ls -lh XP-Game-Player.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: XP-Game-Player-APK
+          path: XP-Game-Player.apk
+          retention-days: 30
