@@ -19,7 +19,7 @@ jobs:
           sudo dpkg --add-architecture i386
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            wine64 wine32 winetricks cabextract unzip p7zip-full xvfb \
+            wine64 wine32 winetricks cabextract unzip p7zip-full xvfb zip \
             libgl1-mesa-glx libglu1-mesa
 
       - name: Create Wine prefix (Windows XP) – fully headless + force
@@ -32,18 +32,14 @@ jobs:
           mkdir -p "$WINEPREFIX"
           rm -rf "$WINEPREFIX"/* 2>/dev/null || true
 
-          # Virtual display for the entire step
           Xvfb :99 -screen 0 1024x768x24 -ac +extension GLX +render -noreset > /tmp/xvfb.log 2>&1 &
           XVFB_PID=$!
           export DISPLAY=:99
           sleep 3
 
-          # Make sure wine can see the display
           xvfb-run -a wineboot --init || true
           sleep 2
 
-          # Force install – ignores outdated sha256 sums that Microsoft changes
-          # vcrun6 deliberately omitted (GUI-only installer, not needed)
           xvfb-run -a winetricks -q --force winxp || true
           xvfb-run -a winetricks -q --force corefonts || true
           xvfb-run -a winetricks -q --force vcrun2005 || true
@@ -51,22 +47,15 @@ jobs:
           xvfb-run -a winetricks -q --force vcrun2010 || true
           xvfb-run -a winetricks -q --force d3dx9 || true
 
-          # Explicit XP version + common overrides
           xvfb-run -a wine reg add "HKCU\\Software\\Wine" /v Version /t REG_SZ /d "winxp" /f || true
           xvfb-run -a wine reg add "HKCU\\Software\\Wine\\DllOverrides" /v d3d9 /t REG_SZ /d "native,builtin" /f || true
           xvfb-run -a wine reg add "HKCU\\Software\\Wine\\DllOverrides" /v d3d8 /t REG_SZ /d "native,builtin" /f || true
 
-          # Pre-create dosdevices so the artifact already has the structure
           mkdir -p "$WINEPREFIX/dosdevices"
-          # Placeholder – real mapping is recreated at runtime by the launch scripts
           ln -sfn /tmp "$WINEPREFIX/dosdevices/d:" || true
 
-          # Kill virtual display cleanly
           kill $XVFB_PID 2>/dev/null || true
           sleep 1
-
-          # Quick sanity
-          ls -la "$WINEPREFIX" | head -10
           echo "Prefix created."
 
       - name: Extract game zip
@@ -78,7 +67,6 @@ jobs:
           fi
           mkdir -p game
           unzip -o plants_vs_zombies.zip -d game
-          # Flatten single top-level directory if present
           if [ $(find game -mindepth 1 -maxdepth 1 -type d | wc -l) -eq 1 ] && \
              [ $(find game -mindepth 1 -maxdepth 1 -type f | wc -l) -eq 0 ]; then
             TOP=$(find game -mindepth 1 -maxdepth 1 -type d)
@@ -178,35 +166,41 @@ jobs:
           WINEDEBUG: -all
         run: |
           xvfb-run -a wine --version
-          echo "--- dosdevices ---"
           ls -l "$WINEPREFIX/dosdevices/" || true
-          echo "--- Wine version registry ---"
           xvfb-run -a wine reg query "HKCU\\Software\\Wine" /v Version || true
           echo "Smoke test done."
 
-      - name: Package artifact
+      - name: Package as real ZIP (no .tar.gz)
         run: |
           mkdir -p dist
           cp -a wine-xp dist/
           cp -a game dist/
           cp run-game.sh run-any-exe.sh play-from-downloads.sh dist/
           cat > dist/README.txt << 'EOF'
-          Windows XP Wine Runner (headless-built, Downloads-enabled)
+          Windows XP Wine Runner
 
-          Usage:
-            ./run-game.sh                     # launch the bundled game pack
-            ./play-from-downloads.sh          # interactive list of every .exe in \~/Downloads
-            ./run-any-exe.sh \~/Downloads/foo.exe
+          How to use (Linux):
+            1. Extract this entire zip
+            2. Open a terminal inside the extracted folder
+            3. Run one of:
+                 ./run-game.sh
+                 ./play-from-downloads.sh
+                 ./run-any-exe.sh \~/Downloads/yourgame.exe
 
-          Drive mapping (recreated every launch):
-            D:  →  \~/Downloads
+          D: drive inside Wine = your real Downloads folder
           EOF
-          tar -czf xp-pvz-runner.tar.gz -C dist .
-          ls -lh xp-pvz-runner.tar.gz
+
+          # Create a normal .zip that any phone / Windows / Android can open
+          cd dist
+          zip -r -9 ../xp-pvz-runner.zip .
+          cd ..
+          ls -lh xp-pvz-runner.zip
+          echo "=== ZIP contents preview ==="
+          unzip -l xp-pvz-runner.zip | head -30
 
       - name: Upload runner artifact
         uses: actions/upload-artifact@v4
         with:
           name: xp-pvz-runner
-          path: xp-pvz-runner.tar.gz
+          path: xp-pvz-runner.zip
           retention-days: 30
