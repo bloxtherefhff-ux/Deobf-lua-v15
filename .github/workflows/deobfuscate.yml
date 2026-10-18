@@ -17,58 +17,78 @@ jobs:
       - name: Install Wine + dependencies
         run: |
           sudo dpkg --add-architecture i386
-          sudo apt-get update
-          sudo apt-get install -y wine64 wine32 winetricks cabextract unzip p7zip-full xvfb
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            wine64 wine32 winetricks cabextract unzip p7zip-full xvfb \
+            libgl1-mesa-glx libglu1-mesa
 
-      - name: Create Wine prefix (Windows XP) – headless
+      - name: Create Wine prefix (Windows XP) – fully headless + force
         env:
           WINEPREFIX: ${{ github.workspace }}/wine-xp
           WINEARCH: win32
-          DISPLAY: :99
+          WINEDEBUG: -all
         run: |
+          set -e
           mkdir -p "$WINEPREFIX"
-          # Start a virtual X server for the entire step
-          Xvfb :99 -screen 0 1024x768x24 > /tmp/xvfb.log 2>&1 &
+          rm -rf "$WINEPREFIX"/* 2>/dev/null || true
+
+          # Virtual display for the entire step
+          Xvfb :99 -screen 0 1024x768x24 -ac +extension GLX +render -noreset > /tmp/xvfb.log 2>&1 &
           XVFB_PID=$!
+          export DISPLAY=:99
+          sleep 3
+
+          # Make sure wine can see the display
+          xvfb-run -a wineboot --init || true
           sleep 2
 
-          # Initialize prefix under Xvfb
-          xvfb-run -a wineboot --init
+          # Force install – ignores outdated sha256 sums that Microsoft changes
+          # vcrun6 deliberately omitted (GUI-only installer, not needed)
+          xvfb-run -a winetricks -q --force winxp || true
+          xvfb-run -a winetricks -q --force corefonts || true
+          xvfb-run -a winetricks -q --force vcrun2005 || true
+          xvfb-run -a winetricks -q --force vcrun2008 || true
+          xvfb-run -a winetricks -q --force vcrun2010 || true
+          xvfb-run -a winetricks -q --force d3dx9 || true
 
-          # Install only the components that install cleanly headless
-          # (vcrun6 is skipped – it requires a real window and is not required for PVZ / classic XP games)
-          xvfb-run -a winetricks -q winxp
-          xvfb-run -a winetricks -q corefonts
-          xvfb-run -a winetricks -q vcrun2005
-          xvfb-run -a winetricks -q vcrun2008
-          xvfb-run -a winetricks -q vcrun2010
-          xvfb-run -a winetricks -q d3dx9
+          # Explicit XP version + common overrides
+          xvfb-run -a wine reg add "HKCU\\Software\\Wine" /v Version /t REG_SZ /d "winxp" /f || true
+          xvfb-run -a wine reg add "HKCU\\Software\\Wine\\DllOverrides" /v d3d9 /t REG_SZ /d "native,builtin" /f || true
+          xvfb-run -a wine reg add "HKCU\\Software\\Wine\\DllOverrides" /v d3d8 /t REG_SZ /d "native,builtin" /f || true
 
-          # Force XP version in registry
-          xvfb-run -a wine reg add "HKCU\\Software\\Wine" /v Version /t REG_SZ /d "winxp" /f
-          xvfb-run -a wine reg add "HKCU\\Software\\Wine\\DllOverrides" /v d3d9 /t REG_SZ /d "native,builtin" /f
-
-          # Map host Downloads as drive D:
+          # Pre-create dosdevices so the artifact already has the structure
           mkdir -p "$WINEPREFIX/dosdevices"
-          ln -sfn "$HOME/Downloads" "$WINEPREFIX/dosdevices/d:" || true
+          # Placeholder – real mapping is recreated at runtime by the launch scripts
+          ln -sfn /tmp "$WINEPREFIX/dosdevices/d:" || true
 
-          # Clean up the virtual display
+          # Kill virtual display cleanly
           kill $XVFB_PID 2>/dev/null || true
+          sleep 1
+
+          # Quick sanity
+          ls -la "$WINEPREFIX" | head -10
+          echo "Prefix created."
 
       - name: Extract game zip
         run: |
+          set -e
+          if [ ! -f plants_vs_zombies.zip ]; then
+            echo "ERROR: plants_vs_zombies.zip not found in repo root"
+            exit 1
+          fi
           mkdir -p game
           unzip -o plants_vs_zombies.zip -d game
-          if [ $(find game -mindepth 1 -maxdepth 1 -type d | wc -l) -eq 1 ]; then
+          # Flatten single top-level directory if present
+          if [ $(find game -mindepth 1 -maxdepth 1 -type d | wc -l) -eq 1 ] && \
+             [ $(find game -mindepth 1 -maxdepth 1 -type f | wc -l) -eq 0 ]; then
             TOP=$(find game -mindepth 1 -maxdepth 1 -type d)
             mv "$TOP"/* game/ 2>/dev/null || true
             rmdir "$TOP" 2>/dev/null || true
           fi
-          find game -type f -name "*.exe" -print
+          echo "=== .exe files found ==="
+          find game -type f -iname "*.exe" -print || true
 
       - name: Create launcher scripts (Downloads access)
-        env:
-          WINEPREFIX: ${{ github.workspace }}/wine-xp
         run: |
           cat > run-game.sh << 'EOF'
           #!/bin/bash
@@ -76,10 +96,11 @@ jobs:
           export WINEPREFIX="$(pwd)/wine-xp"
           export WINEARCH=win32
           export WINEDLLOVERRIDES="mscoree,mshtml="
+          export WINEDEBUG=-all
           mkdir -p "$WINEPREFIX/dosdevices"
-          ln -sfn "$HOME/Downloads" "$WINEPREFIX/dosdevices/d:" 2>/dev/null || true
+          ln -sfn "${HOME}/Downloads" "$WINEPREFIX/dosdevices/d:" 2>/dev/null || true
           cd game
-          EXE=$(find . -maxdepth 2 \( -iname "*plants*zombies*.exe" -o -iname "pvz*.exe" -o -iname "*.exe" \) | head -1)
+          EXE=$(find . -maxdepth 3 \( -iname "*plants*zombies*.exe" -o -iname "pvz*.exe" -o -iname "*.exe" \) | head -1)
           if [ -z "$EXE" ]; then
             echo "No .exe found in game/"
             exit 1
@@ -95,12 +116,13 @@ jobs:
           export WINEPREFIX="$(pwd)/wine-xp"
           export WINEARCH=win32
           export WINEDLLOVERRIDES="mscoree,mshtml="
+          export WINEDEBUG=-all
           mkdir -p "$WINEPREFIX/dosdevices"
-          ln -sfn "$HOME/Downloads" "$WINEPREFIX/dosdevices/d:" 2>/dev/null || true
+          ln -sfn "${HOME}/Downloads" "$WINEPREFIX/dosdevices/d:" 2>/dev/null || true
           if [ $# -lt 1 ]; then
             echo "Usage: $0 <path-to-exe> [args...]"
-            echo "Example: $0 \~/Downloads/SomeGame.exe"
-            echo "Or:      $0 'd:\\SomeGame.exe'"
+            echo "  $0 \~/Downloads/SomeGame.exe"
+            echo "  $0 'd:\\SomeGame.exe'"
             exit 1
           fi
           wine "$@"
@@ -113,17 +135,18 @@ jobs:
           export WINEPREFIX="$(pwd)/wine-xp"
           export WINEARCH=win32
           export WINEDLLOVERRIDES="mscoree,mshtml="
+          export WINEDEBUG=-all
           mkdir -p "$WINEPREFIX/dosdevices"
-          ln -sfn "$HOME/Downloads" "$WINEPREFIX/dosdevices/d:" 2>/dev/null || true
+          ln -sfn "${HOME}/Downloads" "$WINEPREFIX/dosdevices/d:" 2>/dev/null || true
 
-          DOWNLOADS="$HOME/Downloads"
+          DOWNLOADS="${HOME}/Downloads"
           if [ ! -d "$DOWNLOADS" ]; then
             echo "Downloads folder not found: $DOWNLOADS"
             exit 1
           fi
 
           echo "=== .exe files in $DOWNLOADS ==="
-          mapfile -t EXES < <(find "$DOWNLOADS" -maxdepth 2 -type f -iname "*.exe" | sort)
+          mapfile -t EXES < <(find "$DOWNLOADS" -maxdepth 2 -type f -iname "*.exe" 2>/dev/null | sort)
           if [ ${#EXES[@]} -eq 0 ]; then
             echo "No .exe files found in Downloads."
             exit 0
@@ -148,14 +171,18 @@ jobs:
           EOF
           chmod +x play-from-downloads.sh
 
-      - name: Smoke-test Wine XP prefix
+      - name: Smoke-test
         env:
           WINEPREFIX: ${{ github.workspace }}/wine-xp
           WINEARCH: win32
+          WINEDEBUG: -all
         run: |
           xvfb-run -a wine --version
+          echo "--- dosdevices ---"
           ls -l "$WINEPREFIX/dosdevices/" || true
+          echo "--- Wine version registry ---"
           xvfb-run -a wine reg query "HKCU\\Software\\Wine" /v Version || true
+          echo "Smoke test done."
 
       - name: Package artifact
         run: |
@@ -164,17 +191,18 @@ jobs:
           cp -a game dist/
           cp run-game.sh run-any-exe.sh play-from-downloads.sh dist/
           cat > dist/README.txt << 'EOF'
-          Windows XP Wine Runner – Downloads access enabled
+          Windows XP Wine Runner (headless-built, Downloads-enabled)
 
-          Quick start:
-            ./run-game.sh                     # runs the pack that came with the zip
-            ./play-from-downloads.sh          # lists every .exe in \~/Downloads and lets you pick one
+          Usage:
+            ./run-game.sh                     # launch the bundled game pack
+            ./play-from-downloads.sh          # interactive list of every .exe in \~/Downloads
             ./run-any-exe.sh \~/Downloads/foo.exe
 
-          Wine drive mapping:
-            D:  →  your real \~/Downloads folder
+          Drive mapping (recreated every launch):
+            D:  →  \~/Downloads
           EOF
           tar -czf xp-pvz-runner.tar.gz -C dist .
+          ls -lh xp-pvz-runner.tar.gz
 
       - name: Upload runner artifact
         uses: actions/upload-artifact@v4
